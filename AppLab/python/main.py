@@ -1,104 +1,106 @@
-import numpy as np
-import scipy.io as sio
-import time
-import sys
+# SPDX-FileCopyrightText: Copyright (C) 2025 ARDUINO SA
+# SPDX-License-Identifier: MPL-2.0
+
+from arduino.app_utils import *
 import math
-from arduino import bridge  # AppLab Bridge Library
+import cmath
 
-# --- PHYSICS & CODEBOOK FUNCTIONS ---
-def force_flat_float(data):
-    if np.ndim(data) == 0:
-        try: return np.array([float(data)])
-        except: return np.array([])
-    flat_list = []
-    try: iterator = data.flat
-    except AttributeError: iterator = data
-    for item in iterator:
-        if isinstance(item, (int, float, np.number)): flat_list.append(float(item))
-        else: flat_list.extend(force_flat_float(item))
-    return np.array(flat_list)
+# ==========================================
+# 1. USER CONFIGURATION
+# ==========================================
+L = 4
+M_COLS = 13
+PHI_VALUES = [0, 180]
+PHI_RAND = [90, 0, 90, 0, 90, 90, 0, 90, 0, 90, 0, 90, 0]
+USE_PREPHASE = False
 
-def parse_codebook(file_name, m_sel, L=4):
-    mat = sio.loadmat(file_name)
-    data = mat['results']
-    while data.shape == (1, 1): data = data[0, 0]
-    center_idx = (len(data) - 1) // 2
-    idx = center_idx + m_sel
-    harmonic_data = data[idx]
+# The desired Beam Direction (Gradient)
+STEERING_ANGLE = 30  
+
+# The 4 QPSK Symbols (Modulation Phases)
+# Matches "With_QPSK_L_4_1.m" logic for bit_level=2
+QPSK_PHASES = [0, 90, 180, 270]
+
+# ==========================================
+# 2. STATE
+# ==========================================
+state = {
+    'cb': [],
+    'symbol_idx': 0  # Start at Index 0 (45 degrees)
+}
+
+# ==========================================
+# 3. MATH HELPERS
+# ==========================================
+def sinc(m): return 1.0 if m==0 else math.sin(math.pi*m/L)/(math.pi*m/L)
+
+def generate_codebook():
+    cb = []
+    base = len(PHI_VALUES)
+    for i in range(base**L):
+        seq = [(i // (base**n)) % base for n in range(L)]
+        gamma_seq = [PHI_VALUES[x] for x in seq]
+        a_m = complex(0,0)
+        for n in range(1, L+1):
+            term = cmath.exp(1j*math.radians(gamma_seq[n-1])) * sinc(1) * \
+                   cmath.exp(-1j*math.pi*1*(2*n-1)/L)
+            a_m += term / L
+        if abs(a_m) > 0.6:
+            ph = math.degrees(cmath.phase(a_m)) % 360
+            cb.append({'Gamma': gamma_seq, 'Phase': ph})
+    return cb
+
+def get_pattern(phase, cb):
+    best = min(cb, key=lambda x: abs((x['Phase'] - phase + 180) % 360 - 180))
+    val = 0
+    for t, p in enumerate(best['Gamma']):
+        if p > 90: val |= (1 << t)
+    return val
+
+# ==========================================
+# 4. API FUNCTION (Called by Arduino)
+# ==========================================
+def get_ris_frame():
+    # Init Codebook
+    if not state['cb']:
+        print("Generating Codebook...", flush=True)
+        state['cb'] = generate_codebook()
+
+    # 1. Get Current QPSK Phase (Base)
+    idx = state['symbol_idx']
+    base_phase = QPSK_PHASES[idx]
+
+    # 2. Calculate Gradient (Delta)
+    delta = math.degrees(2 * math.pi * 0.5 * math.sin(math.radians(STEERING_ANGLE)))
     
-    # Nuclear Extraction
-    raw_p = force_flat_float(harmonic_data['Phase'])
-    raw_g = force_flat_float(harmonic_data['Gamma'])
+    pat_list = []
+    col0_debug = 0
     
-    num_entries = len(raw_p)
-    gammas_reshaped = raw_g.reshape((num_entries, L))
-    
-    return [{'Phase': raw_p[i], 'Gamma': gammas_reshaped[i, :]} for i in range(num_entries)]
-
-def local_map(phase_needed, gamma_list):
-    best_k = 0
-    best_diff = float('inf')
-    for k in range(len(gamma_list)):
-        diff = np.abs(np.mod(gamma_list[k]['Phase'] - phase_needed + 180, 360) - 180)
-        if diff < best_diff:
-            best_diff = diff
-            best_k = k
-    return np.where(np.isclose(gamma_list[best_k]['Gamma'], 180), 1, 0)
-
-# --- MAIN EXECUTION ---
-def main():
-    print("============================================================")
-    print("🚀 Unified RIS Modulation & Beam Steering System")
-    
-    # 1. User Input (Simulating the interactive part of the modulation code)
-    m_sel = 1      # Default Harmonic
-    bit_res = 1    # 1-bit resolution
-    theta_des = 45 # Default angle
-    
-    # 2. Physics Params
-    M, N, L = 16, 16, 4
-    d_lam = 0.5
-    Phi_rand_1D = 90 * np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1])
-    Delta_phi_deg = np.rad2deg(2 * np.pi * d_lam * np.sin(np.deg2rad(theta_des)))
-
-    # 3. Load Codebook
-    print("📂 Loading Codebook...")
-    try:
-        GammaList = parse_codebook('One_bit_Code_Book.mat', m_sel, L=4)
-    except Exception as e:
-        print(f"❌ Error loading .mat file: {e}")
-        return
-
-    print("📡 Calculating Beam Pattern...")
-    while True:
-        # Calculate Phase Requirements
-        Phi_req = np.mod(np.arange(M) * Delta_phi_deg, 360)
+    # 3. Generate Patterns for all columns
+    for k in range(M_COLS):
+        # Formula: Base + Gradient (Matches MATLAB line 92)
+        phi_req = (base_phase + k * delta) % 360
         
-        # Generate RIS Matrix (16x4)
-        RIS_matrix = np.zeros((M, L))
-        for m in range(M):
-            RIS_matrix[m, :] = local_map(Phi_req[m], GammaList)
+        if USE_PREPHASE: 
+            phi_req = (phi_req - PHI_RAND[k]) % 360
+            
+        pat = get_pattern(phi_req, state['cb'])
+        pat_list.append(str(pat))
+        
+        if k == 0: col0_debug = pat
 
-        # Pack row-major flatten to 20 bytes (160 bits)
-        flat_bits = RIS_matrix.flatten().astype(np.uint8)
-        packed_bytes = np.packbits(flat_bits)
-        hex_str = ''.join([f'{b:02X}' for b in packed_bytes[:20]])
+    result_str = ",".join(pat_list)
+    
+    print(f"Sent Symbol {idx+1}/4: Phase={base_phase}° | Col0: {col0_debug}", flush=True)
 
-        # 4. BRIDGE: Send to Arduino
-        try:
-            print(f"📤 Sending Hex Beam to MCU: {hex_str}")
-            response = bridge.call('set_ris_beam', hex_str)
-            print(f"📥 MCU Response: {response}")
-        except Exception as e:
-            print(f"⏳ Waiting for Bridge connection... {e}")
+    # 4. Cycle to NEXT Symbol for the next call
+    state['symbol_idx'] = (idx + 1) % 4
+    
+    return result_str
 
-        time.sleep(3) # Update every 3 seconds
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-main.py
+# ==========================================
+# 5. RUN SERVER
+# ==========================================
+print("QPSK Server Ready. Waiting for Arduino...", flush=True)
+Bridge.provide("get_ris_frame", get_ris_frame)
+App.run()

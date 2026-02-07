@@ -1,51 +1,85 @@
-#include <Arduino_RouterBridge.h> 
-#include <Arduino_LED_Matrix.h>
-#include "ris_codebook.h"        
+#include <Arduino_RouterBridge.h>
 
-ArduinoLEDMatrix matrix;
-uint32_t frame[] = { 0, 0, 0 }; 
+extern "C" void matrixWrite(const uint32_t* buf);
+extern "C" void matrixBegin();
 
-// The RPC Function Python calls
-void set_ris_beam(int idx) {
-    if (idx < 0 || idx > 3) return;
+volatile int ris_cols[13] = {0};
 
-    // Flash all LEDs to prove data arrived
-    frame[0] = 0xFFFFFFFF; frame[1] = 0xFFFFFFFF; frame[2] = 0xFFFFFFFF;
-    matrix.loadFrame(frame);
-    delay(100); 
-
-    // Clear and apply pattern
-    frame[0] = 0; frame[1] = 0; frame[2] = 0;
-    for (int r = 0; r < 8; r++) {
-        for (int c = 0; c < 4; c++) {
-            if (RIS_LOOKUP[idx][r][c] == 1) {
-                int bit_pos = (r * 4) + c;
-                if (bit_pos < 32) frame[0] |= (1UL << (31 - bit_pos));
-            }
-        }
-    }
-    matrix.loadFrame(frame);
-}
+int t_step = 0;
+unsigned long last_render = 0;
+unsigned long last_fetch = 0;
 
 void setup() {
-    // 1. Start LEDs FIRST (So we see if it's alive)
-    matrix.begin();
-    
-    // 2. Show "I am awake" dot (Bottom-Right)
-    frame[2] = 0x1; 
-    matrix.loadFrame(frame);
-    
-    // 3. Start Bridge LAST (If this hangs, the dot stays on)
-    Bridge.begin();
+  delay(3000); // Safety delay for Linux boot
+  matrixBegin();
+  
+  // Flash White
+  uint32_t all[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+  matrixWrite(all);
+  delay(500);
+  uint32_t clr[4] = {0};
+  matrixWrite(clr);
+
+  Bridge.begin();
 }
 
 void loop() {
-    // HEARTBEAT: This pixel will blink every 500ms
-    // If it stops blinking, the MCU has crashed.
-    static unsigned long lastBlink = 0;
-    if (millis() - lastBlink > 500) {
-        frame[2] ^= 0x1; 
-        matrix.loadFrame(frame);
-        lastBlink = millis();
+  unsigned long now = millis();
+
+  // 1. DATA FETCH LOOP (Every 1.5 Seconds)
+  // This controls the speed of the QPSK Symbol Cycle
+  if (now - last_fetch > 4000) {
+    last_fetch = now;
+    
+    String dataString;
+    // Ask Python for the next symbol
+    bool ok = Bridge.call("get_ris_frame").result(dataString);
+    
+    if (ok && dataString.length() > 0) {
+       parseCSV(dataString);
     }
+  }
+
+  // 2. RENDER LOOP (Every 100ms)
+  // This controls the flicker speed (Time Coding)
+  if (now - last_render > 1000) {
+    last_render = now;
+    renderFrame(t_step);
+    t_step = (t_step + 1) % 4; 
+  }
+}
+
+void parseCSV(String data) {
+  int col_idx = 0;
+  int start = 0;
+  for (int i = 0; i < data.length(); i++) {
+    if (data.charAt(i) == ',') {
+      if (col_idx < 13) {
+        ris_cols[col_idx] = data.substring(start, i).toInt();
+        col_idx++;
+      }
+      start = i + 1;
+    }
+  }
+  if (col_idx < 13) {
+     ris_cols[col_idx] = data.substring(start).toInt();
+  }
+}
+
+void setPixel(uint32_t* frame, int r, int c) {
+  int idx = r * 13 + c;
+  if (idx < 104) frame[idx / 32] |= (1UL << (idx % 32));
+}
+
+void renderFrame(int t) {
+  uint32_t frame[4] = {0};
+
+  for (int c = 0; c < 13; c++) {
+    int pat = ris_cols[c];
+    if ((pat >> t) & 1) {
+      // Draw Full Height Bar
+      for(int r=0; r<8; r++) setPixel(frame, r, c);
+    }
+  }
+  matrixWrite(frame);
 }
