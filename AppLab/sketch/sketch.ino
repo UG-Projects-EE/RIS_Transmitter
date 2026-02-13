@@ -3,7 +3,11 @@
 extern "C" void matrixWrite(const uint32_t* buf);
 extern "C" void matrixBegin();
 
-volatile int ris_cols[13] = {0};
+volatile int ris_cols[16] = {0};
+const int ris_pins[16] = {
+  2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 
+  A0, A1, A2, A3
+};
 
 int t_step = 0;
 unsigned long last_render = 0;
@@ -12,7 +16,10 @@ unsigned long last_fetch = 0;
 void setup() {
   delay(3000); // Safety delay for Linux boot
   matrixBegin();
-  
+  for (int i = 0; i < 16; i++) {
+    pinMode(ris_pins[i], OUTPUT);
+    digitalWrite(ris_pins[i], LOW); // Start OFF
+  }
   // Flash White
   uint32_t all[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
   matrixWrite(all);
@@ -45,6 +52,7 @@ void loop() {
   if (now - last_render > 1000) {
     last_render = now;
     renderFrame(t_step);
+    driveHardware(t_step);
     t_step = (t_step + 1) % 4; 
   }
 }
@@ -54,14 +62,14 @@ void parseCSV(String data) {
   int start = 0;
   for (int i = 0; i < data.length(); i++) {
     if (data.charAt(i) == ',') {
-      if (col_idx < 13) {
+      if (col_idx < 16) {
         ris_cols[col_idx] = data.substring(start, i).toInt();
         col_idx++;
       }
       start = i + 1;
     }
   }
-  if (col_idx < 13) {
+  if (col_idx < 16) {
      ris_cols[col_idx] = data.substring(start).toInt();
   }
 }
@@ -82,4 +90,14 @@ void renderFrame(int t) {
     }
   }
   matrixWrite(frame);
+}
+
+void driveHardware(int t) {
+  uint32_t frame[4] = {0};
+
+  for (int c = 0; c < 16; c++) {
+    int pat = ris_cols[c];
+    int state = (pat >> t) & 1;
+    digitalWrite(ris_pins[c], state);
+  }
 }

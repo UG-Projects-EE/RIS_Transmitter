@@ -9,7 +9,7 @@ import cmath
 # 1. USER CONFIGURATION
 # ==========================================
 L = 4
-M_COLS = 13
+M_COLS = 16
 PHI_VALUES = [0, 180]
 PHI_RAND = [90, 0, 90, 0, 90, 90, 0, 90, 0, 90, 0, 90, 0]
 USE_PREPHASE = False
